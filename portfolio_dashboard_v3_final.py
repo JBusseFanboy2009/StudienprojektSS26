@@ -11,7 +11,7 @@ from uuid import uuid4
 from yahooquery import Ticker as YQTicker
 from yahooquery import search as yahoo_search
 
-APP_VERSION = "3.4 – Navigation und What-if-Suche verbessert"
+APP_VERSION = "Finale Version - Moodz gerade am Saufen, Lugge und Patrick am carryn"
 
 # ==========================================
 # 1. SETUP & SESSION STATE
