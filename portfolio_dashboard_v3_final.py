@@ -11,7 +11,7 @@ from uuid import uuid4
 from yahooquery import Ticker as YQTicker
 from yahooquery import search as yahoo_search
 
-APP_VERSION = "3.3 – What-if-Vergleich mehrerer Wertpapiere"
+APP_VERSION = "3.4 – Navigation und What-if-Suche verbessert"
 
 # ==========================================
 # 1. SETUP & SESSION STATE
@@ -36,7 +36,7 @@ def normalize_weight_pct(value: Any) -> float | None:
         v = float(value)
     except (TypeError, ValueError):
         return None
-    if v != v:
+    if not np.isfinite(v):
         return None
     if 0 < abs(v) <= 1.0:
         return v * 100.0
@@ -153,6 +153,18 @@ def search_ticker(query: str) -> list[str]:
         return []
 
 
+def select_first_search_result(search_key: str, selection_key: str) -> None:
+    """Select the first Yahoo result whenever a search input is submitted/changed.
+
+    Streamlit executes text-input callbacks before rebuilding the widgets. Setting
+    the paired selectbox state here ensures that the first result is already
+    selected when the new search results are displayed.
+    """
+    query = str(st.session_state.get(search_key, "") or "").strip()
+    results = search_ticker(query) if query else []
+    st.session_state[selection_key] = results[0] if results else None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_instrument_currency(ticker: str) -> str:
     """Detect the trading currency of a single Yahoo Finance instrument."""
@@ -217,11 +229,11 @@ def get_current_price_and_trend(ticker: str) -> tuple[float, float]:
     try:
         t = yf.Ticker(ticker)
         fast = t.fast_info
-        price = fast.get("lastPrice") or fast.get("regularMarketPrice")
-        prev_close = fast.get("previousClose")
-        if price is not None and prev_close is not None and safe_float(prev_close) > 0:
-            price_f = safe_float(price)
-            prev_f = safe_float(prev_close)
+        price_f = safe_float(fast.get("lastPrice"), np.nan)
+        if not np.isfinite(price_f) or price_f <= 0:
+            price_f = safe_float(fast.get("regularMarketPrice"), np.nan)
+        prev_f = safe_float(fast.get("previousClose"), np.nan)
+        if np.isfinite(price_f) and price_f > 0 and np.isfinite(prev_f) and prev_f > 0:
             trend_pct = ((price_f - prev_f) / prev_f) * 100.0
             return price_f, trend_pct
     except Exception:
@@ -852,7 +864,11 @@ def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
                 if isinstance(close_df, pd.DataFrame):
                     if ticker in close_df.columns:
                         return close_df[ticker]
-                    return close_df.iloc[:, 0]
+                    # A single-ticker response may use a differently labelled
+                    # column; do not substitute another ticker in multi-asset data.
+                    if close_df.shape[1] == 1:
+                        return close_df.iloc[:, 0]
+                    return pd.Series(dtype=float, name=ticker)
                 return close_df
 
             # Fallback for the alternative orientation.
@@ -861,14 +877,122 @@ def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
                 if isinstance(close_df, pd.DataFrame):
                     if ticker in close_df.columns:
                         return close_df[ticker]
-                    return close_df.iloc[:, 0]
+                    if close_df.shape[1] == 1:
+                        return close_df.iloc[:, 0]
+                    return pd.Series(dtype=float, name=ticker)
                 return close_df
 
         if "Close" in df.columns:
             return df["Close"]
-        return df.iloc[:, 0]
+        return pd.Series(dtype=float, name=ticker)
     except Exception:
         return pd.Series(dtype=float)
+
+
+def build_eur_return_matrix(
+    tickers: list[str],
+    period: str = "1y",
+    min_observations: int = 30,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Build daily returns from adjusted historical values expressed in EUR.
+
+    Currency conversion is performed on the daily value series before returns,
+    so non-EUR assets include both market-price and FX movements. Only tickers
+    with valid prices/FX and a common observation window are used.
+    """
+    clean_tickers = list(dict.fromkeys(str(t).upper().strip() for t in tickers if str(t).strip()))
+    if len(clean_tickers) < 2:
+        return pd.DataFrame(), ["Für eine Risikobewertung werden mindestens zwei Wertpapiere benötigt."]
+
+    try:
+        data = yf.download(clean_tickers, period=period, progress=False, auto_adjust=True)
+    except Exception:
+        return pd.DataFrame(), ["Historische Kursdaten für das Risk-O-Meter konnten nicht abgerufen werden."]
+    if data is None or data.empty:
+        return pd.DataFrame(), ["Für die ausgewählten Wertpapiere sind keine historischen Kursdaten verfügbar."]
+
+    local_prices: dict[str, pd.Series] = {}
+    currencies: dict[str, str] = {}
+    warnings: list[str] = []
+    for ticker in clean_tickers:
+        prices = extract_close_series(data, ticker).dropna()
+        if prices.empty:
+            warnings.append(f"{ticker}: Keine eindeutige historische Kursreihe verfügbar; Position im Risk-O-Meter ausgelassen.")
+            continue
+
+        idx = pd.DatetimeIndex(pd.to_datetime(prices.index))
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        prices.index = idx.normalize()
+        prices = pd.to_numeric(prices, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        prices = prices[~prices.index.duplicated(keep="last")].sort_index()
+        prices = prices[prices > 0]
+        if prices.empty:
+            warnings.append(f"{ticker}: Keine gültigen positiven Kurse verfügbar; Position im Risk-O-Meter ausgelassen.")
+            continue
+        local_prices[ticker] = prices
+        currencies[ticker] = get_instrument_currency(ticker)
+
+    if len(local_prices) < 2:
+        return pd.DataFrame(), warnings + ["Es liegen weniger als zwei auswertbare Kursreihen vor."]
+
+    # Validate FX availability before determining the common period. Otherwise,
+    # a ticker that later gets excluded could unnecessarily shorten the sample.
+    fx_by_ticker: dict[str, pd.Series] = {}
+    for ticker, prices in list(local_prices.items()):
+        currency = currencies[ticker]
+        fx = get_historical_fx_series(
+            currency,
+            prices.index.min().date().isoformat(),
+            prices.index.max().date().isoformat(),
+        )
+        fx.index = pd.DatetimeIndex(pd.to_datetime(fx.index)).normalize()
+        fx = pd.to_numeric(fx, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        fx = fx[~fx.index.duplicated(keep="last")].sort_index()
+        if currency == "EUR":
+            fx = fx.fillna(1.0)
+        elif fx.empty or fx.isna().all() or not np.isfinite(fx.to_numpy(dtype=float)).any():
+            warnings.append(f"{ticker}: Kein verlässlicher historischer Wechselkurs für {currency}; Position im Risk-O-Meter ausgelassen.")
+            local_prices.pop(ticker, None)
+            currencies.pop(ticker, None)
+            continue
+        fx_by_ticker[ticker] = fx
+
+    if len(local_prices) < 2:
+        return pd.DataFrame(), warnings + ["Es liegen weniger als zwei auswertbare EUR-Zeitreihen vor."]
+
+    # Calculate only over the dates shared by all selected, available instruments.
+    common_start = max(series.index.min() for series in local_prices.values())
+    common_end = min(series.index.max() for series in local_prices.values())
+    if common_start >= common_end:
+        return pd.DataFrame(), warnings + ["Die verfügbaren Wertpapiere haben keinen ausreichenden gemeinsamen Zeitraum."]
+    common_index = pd.date_range(start=common_start, end=common_end, freq="B", name="Datum")
+
+    eur_values: dict[str, pd.Series] = {}
+    for ticker, prices in local_prices.items():
+        fx = fx_by_ticker[ticker]
+        price_aligned = prices.reindex(common_index, method="ffill")
+        fx_aligned = fx.reindex(common_index).ffill().bfill()
+        if fx_aligned.empty or fx_aligned.isna().all() or not np.isfinite(fx_aligned.to_numpy(dtype=float)).any():
+            warnings.append(f"{ticker}: EUR-Zeitreihe konnte wegen fehlender Wechselkurse nicht erstellt werden.")
+            continue
+        eur_series = (price_aligned * fx_aligned).replace([np.inf, -np.inf], np.nan).dropna()
+        if eur_series.empty:
+            warnings.append(f"{ticker}: Keine gültige Zeitreihe in Euro verfügbar.")
+            continue
+        eur_values[ticker] = eur_series.rename(ticker)
+
+    if len(eur_values) < 2:
+        return pd.DataFrame(), warnings + ["Es liegen weniger als zwei auswertbare EUR-Zeitreihen vor."]
+
+    eur_prices = pd.DataFrame(eur_values, index=common_index)
+    returns = eur_prices.pct_change(fill_method=None)
+    returns = returns.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    if len(returns) < min_observations:
+        return pd.DataFrame(), warnings + [
+            f"Der gemeinsame Zeitraum enthält weniger als {min_observations} vollständige tägliche Beobachtungen."
+        ]
+    return returns, warnings
 
 
 def normalize_trades(raw_trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -921,6 +1045,9 @@ def build_portfolio_dataframe(df_trades: pd.DataFrame) -> tuple[pd.DataFrame, li
     working["Purchase FX EUR"] = purchase_fx
     working["Investierter Wert EUR"] = working["Investierter Wert"] * working["Purchase FX EUR"]
 
+    tickers_with_incomplete_fx = set(
+        working.loc[working["Purchase FX EUR"].isna(), "Ticker"].astype(str)
+    )
     grouped = working.groupby("Ticker").agg(
         Quantity=("Quantity", "sum"),
         **{
@@ -928,6 +1055,12 @@ def build_portfolio_dataframe(df_trades: pd.DataFrame) -> tuple[pd.DataFrame, li
             "Investierter Wert EUR": ("Investierter Wert EUR", "sum"),
         },
     ).reset_index()
+    if tickers_with_incomplete_fx:
+        # A partial cost basis can distort P&L. Mark the EUR basis as unknown for
+        # the whole ticker if one or more of its purchase FX rates are unavailable.
+        grouped.loc[
+            grouped["Ticker"].isin(tickers_with_incomplete_fx), "Investierter Wert EUR"
+        ] = np.nan
 
     grouped["Buy Price"] = np.where(
         grouped["Quantity"] > 0,
@@ -1060,26 +1193,34 @@ NAV_OPTIONS = [
     "5. What if",
 ]
 
-# Das Radio hat absichtlich KEINEN Schlüssel, der programmgesteuert verändert wird.
-# Dadurch kann ein Button aus Seite 2 sicher auf die Detailseite wechseln, ohne
-# StreamlitAPIException wegen einer nachträglichen Änderung des Widget-Zustands.
-current_page = st.session_state.current_page
-try:
-    current_index = NAV_OPTIONS.index(current_page)
-except ValueError:
-    current_index = 0
+def sync_navigation_from_radio() -> None:
+    """Persist the page selected in the sidebar radio before the app reruns."""
+    selected = st.session_state.get("navigation_radio")
+    if selected in NAV_OPTIONS:
+        st.session_state.current_page = selected
+        if selected != "3. Detailansicht":
+            st.session_state.detail_ticker = None
 
-selected_page = st.sidebar.radio(
+
+# Use a stable widget key. Passing a changing ``index`` to an unkeyed radio can
+# change its widget identity across reruns, which may make navigation feel like
+# it requires two clicks. Synchronize programmatic navigation (e.g. Detail button)
+# before creating the radio, as Streamlit does not allow changing widget state
+# after that widget has been instantiated in the current run.
+if st.session_state.current_page not in NAV_OPTIONS:
+    st.session_state.current_page = NAV_OPTIONS[0]
+if (
+    "navigation_radio" not in st.session_state
+    or st.session_state.get("navigation_radio") != st.session_state.current_page
+):
+    st.session_state.navigation_radio = st.session_state.current_page
+
+st.sidebar.radio(
     "Gehe zu",
     NAV_OPTIONS,
-    index=current_index,
+    key="navigation_radio",
+    on_change=sync_navigation_from_radio,
 )
-
-# Manuelle Auswahl im Radio wird als separater App-Zustand gespeichert.
-if selected_page != st.session_state.current_page:
-    st.session_state.current_page = selected_page
-    if selected_page != "3. Detailansicht":
-        st.session_state.detail_ticker = None
 
 page = st.session_state.current_page
 
@@ -1448,31 +1589,46 @@ elif page == "3. Detailansicht":
 # SEITE 4: RISK-O-METER
 # ==========================================
 elif page == "4. Risk-O-Meter":
-    st.title(" Risk-O-Meter")
+    st.title("Risk-O-Meter")
 
     if len(df_portfolio) < 2:
         st.warning("Für eine Risiko- & Korrelationsbewertung werden mindestens 2 verschiedene Positionen benötigt.")
     else:
-        with st.spinner("Analysiere Portfoliorisiko (252 Handelstage) ..."):
-            tickers = df_portfolio["Ticker"].tolist()
-            # Use current EUR market values so weights are comparable across currencies.
-            current_values_eur = df_portfolio["Aktueller Wert EUR"].fillna(0).values
-            total_eur = current_values_eur.sum()
-            weights = current_values_eur / total_eur if total_eur > 0 else np.zeros(len(tickers))
+        tickers = df_portfolio["Ticker"].astype(str).tolist()
+        current_values = pd.Series(
+            df_portfolio["Aktueller Wert EUR"].fillna(0).to_numpy(dtype=float),
+            index=tickers,
+            dtype=float,
+        )
 
-            data = yf.download(tickers, period="1y", progress=False, auto_adjust=False)
+        with st.spinner("Analysiere historische EUR-Renditen (252 Handelstage) ..."):
+            returns, risk_warnings = build_eur_return_matrix(tickers)
 
-            if not data.empty:
-                if isinstance(data.columns, pd.MultiIndex):
-                    closes = data["Close"]
-                else:
-                    closes = data["Close"] if "Close" in data.columns else data
+        for risk_warning in risk_warnings:
+            st.warning(risk_warning)
 
-                returns = closes.pct_change().dropna()
+        if returns.empty or len(returns.columns) < 2:
+            st.warning("Für das Risk-O-Meter werden mindestens zwei Wertpapiere mit ausreichenden historischen Kurs- und Wechselkursdaten benötigt.")
+        else:
+            valid_tickers = list(returns.columns)
+            available_values = current_values.reindex(valid_tickers).fillna(0.0)
+            total_available_eur = float(available_values.sum())
+
+            if total_available_eur <= 0:
+                st.warning("Das aktuelle EUR-Portfolio hat keinen positiven Gesamtwert. Das Risiko kann deshalb nicht gewichtet berechnet werden.")
+            else:
+                # Re-normalize the current portfolio weights if a position had to
+                # be omitted because reliable historic EUR data were unavailable.
+                weights = (available_values / total_available_eur).to_numpy(dtype=float)
+                if len(valid_tickers) != len(tickers):
+                    st.info("Die Risikokennzahlen beziehen sich nur auf Positionen mit ausreichenden historischen EUR-Daten. Die Gewichte wurden dafür neu normiert.")
 
                 st.subheader("Korrelations-Heatmap")
-                st.markdown("Zeigt, wie stark sich deine Assets synchron bewegen (1 = identisch, -1 = entgegengesetzt).")
-                corr_matrix = returns.corr()
+                st.markdown(
+                    "Zeigt, wie stark sich die täglichen EUR-Renditen der Assets synchron bewegen "
+                    "(1 = identisch, -1 = entgegengesetzt). Wechselkurseffekte sind enthalten."
+                )
+                corr_matrix = returns[valid_tickers].corr()
                 fig_corr = px.imshow(
                     corr_matrix,
                     text_auto=True,
@@ -1483,17 +1639,11 @@ elif page == "4. Risk-O-Meter":
                 st.plotly_chart(fig_corr, use_container_width=True)
 
                 st.subheader("Portfolio Gesamtrisiko (Volatilität)")
-                cov_matrix = returns.cov() * 252
-                try:
-                    cov_values = cov_matrix.loc[tickers, tickers].values
-                    port_variance = np.dot(weights.T, np.dot(cov_values, weights))
-                except Exception:
-                    # Align defensively if Yahoo returns an incomplete matrix.
-                    aligned = returns.reindex(columns=tickers).dropna(how="all")
-                    cov_values = aligned.cov().fillna(0).values
-                    port_variance = np.dot(weights.T, np.dot(cov_values, weights))
-
-                port_volatility = np.sqrt(max(0, port_variance)) * 100.0
+                cov_matrix = returns[valid_tickers].cov() * 252
+                cov_values = cov_matrix.loc[valid_tickers, valid_tickers].to_numpy(dtype=float)
+                port_variance = float(weights.T @ cov_values @ weights)
+                port_vol = float(np.sqrt(max(0.0, port_variance)))
+                port_volatility = port_vol * 100.0
 
                 risk_profile = "Sehr Avers (Konservativ)"
                 color = "green"
@@ -1509,21 +1659,25 @@ elif page == "4. Risk-O-Meter":
                     unsafe_allow_html=True,
                 )
                 st.markdown(f"**Risikoeinstufung:** {risk_profile}")
+                st.caption(
+                    "Berechnet aus historischen, dividenden- und splitbereinigten Schlusskursen, "
+                    "in Euro umgerechneten Tageswerten und 252 Handelstagen pro Jahr. Historische "
+                    "Volatilität ist keine Prognose künftiger Schwankungen."
+                )
                 st.divider()
 
                 st.subheader("Risikobeitrag pro Position")
-                st.markdown("Anteil der einzelnen Assets an der Gesamtschwankung des Portfolios:")
+                st.markdown("Anteil der einzelnen Assets an der modellierten Gesamtschwankung des Portfolios:")
 
-                port_vol = np.sqrt(max(0, port_variance))
                 if port_vol > 0:
-                    marginal_contrib = np.dot(cov_values, weights) / port_vol
+                    marginal_contrib = (cov_values @ weights) / port_vol
                     component_contrib = weights * marginal_contrib
                     component_contrib_pct = (component_contrib / port_vol) * 100.0
                 else:
-                    component_contrib_pct = np.zeros(len(tickers))
+                    component_contrib_pct = np.zeros(len(valid_tickers))
 
                 risk_df = pd.DataFrame({
-                    "Ticker": tickers,
+                    "Ticker": valid_tickers,
                     "Gewichtung im Portfolio (%)": weights * 100.0,
                     "Beitrag zum Risiko (%)": component_contrib_pct,
                 })
@@ -1541,11 +1695,10 @@ elif page == "4. Risk-O-Meter":
                 if port_vol > 0:
                     max_risk_asset = risk_df.loc[risk_df["Beitrag zum Risiko (%)"].idxmax()]
                     st.info(
-                        f" **Das risikoreichste Asset** in deinem Portfolio ist aktuell **{max_risk_asset['Ticker']}**. "
-                        f"Obwohl es {max_risk_asset['Gewichtung im Portfolio (%)']:.1f}% des Kapitals ausmacht, "
-                        f"verursacht es {max_risk_asset['Beitrag zum Risiko (%)']:.1f}% der Gesamtschwankungen."
+                        f"**Den größten modellierten Risikobeitrag** liefert aktuell **{max_risk_asset['Ticker']}**. "
+                        f"Die Position macht {max_risk_asset['Gewichtung im Portfolio (%)']:.1f}% des berücksichtigten Kapitals aus "
+                        f"und trägt rechnerisch {max_risk_asset['Beitrag zum Risiko (%)']:.1f}% zur Gesamtschwankung bei."
                     )
-
 
 # ==========================================
 # SEITE 5: WHAT IF
@@ -1566,6 +1719,8 @@ elif page == "5. What if":
             "Aktie oder ETF suchen",
             key="whatif_investment_search",
             placeholder="z. B. Microsoft, MSFT oder MSCI World",
+            on_change=select_first_search_result,
+            args=("whatif_investment_search", "whatif_investment_selection"),
         )
     investment_results = search_ticker(investment_search) if investment_search else []
     with inv_col2:
@@ -1698,6 +1853,8 @@ elif page == "5. What if":
             "Aktie oder ETF für die Heatmap suchen",
             key="whatif_heatmap_search",
             placeholder="z. B. Apple, AAPL oder FTSE All-World",
+            on_change=select_first_search_result,
+            args=("whatif_heatmap_search", "whatif_heatmap_selection"),
         )
     heat_results = search_ticker(heat_search) if heat_search else []
     with heat_col2:
@@ -1754,6 +1911,12 @@ elif page == "5. What if":
             if color_limit < 0.01:
                 color_limit = 0.01
             show_text = heatmap_aggregation in ("Jahre", "Monate")
+            if heatmap_aggregation == "Jahre":
+                axis_labels = {"x": "Jahr", "y": "Gesamt", "color": "Rendite (%)"}
+                hover_template = "Jahr: %{x}<br>Rendite: %{z:.2f}%<extra></extra>"
+            else:
+                axis_labels = {"x": "Periode", "y": "Jahr", "color": "Rendite (%)"}
+                hover_template = "Jahr: %{y}<br>Periode: %{x}<br>Rendite: %{z:.2f}%<extra></extra>"
             fig_heat = px.imshow(
                 heat_matrix_pct,
                 aspect="auto",
@@ -1761,10 +1924,10 @@ elif page == "5. What if":
                 color_continuous_scale=[(0.0, "#b2182b"), (0.5, "#f7f7f7"), (1.0, "#1a9850")],
                 zmin=-color_limit,
                 zmax=color_limit,
-                labels={"x": "Periode", "y": "Jahr", "color": "Rendite (%)"},
+                labels=axis_labels,
                 title=f"{heat_ticker} – Periodenrenditen ({heatmap_aggregation})",
             )
-            fig_heat.update_traces(hovertemplate="Jahr: %{y}<br>Periode: %{x}<br>Rendite: %{z:.2f}%<extra></extra>")
+            fig_heat.update_traces(hovertemplate=hover_template)
             if heatmap_aggregation == "Tage":
                 fig_heat.update_layout(height=max(350, min(800, 120 + 30 * len(heat_matrix_pct.index))))
             elif heatmap_aggregation == "Wochen":
@@ -1796,6 +1959,8 @@ elif page == "5. What if":
             "Aktie oder ETF suchen",
             key="whatif_compare_search",
             placeholder="z. B. Nvidia, NVDA oder MSCI World",
+            on_change=select_first_search_result,
+            args=("whatif_compare_search", "whatif_compare_selection"),
         )
     compare_results = search_ticker(compare_search) if compare_search else []
     with compare_result_col:
