@@ -11,11 +11,8 @@ from uuid import uuid4
 from yahooquery import Ticker as YQTicker
 from yahooquery import search as yahoo_search
 
-APP_VERSION = "Finale Version - Moodz gerade am Saufen, Lugge und Patrick am carryn"
+APP_VERSION = "Finale Version"
 
-# ==========================================
-# 1. SETUP & SESSION STATE
-# ==========================================
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
 if "trades" not in st.session_state:
@@ -26,9 +23,7 @@ if "current_page" not in st.session_state:
 if "detail_ticker" not in st.session_state:
     st.session_state.detail_ticker = None
 
-# ==========================================
-# 2. HILFS- & NORMALISIERUNGSFUNKTIONEN
-# ==========================================
+
 def normalize_weight_pct(value: Any) -> float | None:
     if value is None:
         return None
@@ -131,9 +126,7 @@ def delete_all_trades_for_ticker(ticker: str) -> None:
 
 ensure_trade_ids()
 
-# ==========================================
-# 3. DATEN-ABFRAGEN
-# ==========================================
+#DATEN-ABFRAGEN
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_ticker(query: str) -> list[str]:
     if not query or len(query.strip()) < 2:
@@ -186,8 +179,7 @@ def get_instrument_currency(ticker: str) -> str:
     except Exception:
         pass
 
-    # Last-resort fallback. EUR keeps the dashboard usable even if metadata
-    # is temporarily unavailable. A visible warning is shown at portfolio level.
+    #EUR Notlösung
     return "EUR"
 
 
@@ -263,8 +255,8 @@ def get_current_fx_rate(currency: str) -> float | None:
     if currency == "EUR":
         return 1.0
 
-    direct_pair = f"EUR{currency}=X"      # foreign currency per EUR
-    inverse_pair = f"{currency}EUR=X"     # EUR per foreign currency
+    direct_pair = f"EUR{currency}=X"      # andere currency pro EUR
+    inverse_pair = f"{currency}EUR=X"     # EUR pro andere currency
 
     for pair, inverse in ((direct_pair, True), (inverse_pair, False)):
         try:
@@ -572,7 +564,7 @@ def calculate_investment_comparison(
             warnings.append(f"{ticker}: Kein verlässlicher historischer Wechselkurs für {currency}; Wertpapier übersprungen.")
             continue
 
-        # Buy the same EUR amount at the first available close on/after the selected start date.
+        #Buy same EUR amount at first available close after selected start date.
         first_price = safe_float(prices.iloc[0], np.nan)
         first_fx = safe_float(fx.iloc[0], np.nan)
         if not np.isfinite(first_price) or first_price <= 0 or not np.isfinite(first_fx) or first_fx <= 0:
@@ -603,8 +595,8 @@ def calculate_investment_comparison(
     if not available_values:
         return pd.DataFrame(), pd.DataFrame(), warnings or ["Für die ausgewählten Wertpapiere sind keine Daten verfügbar."]
 
-    # Use a common business-day axis for comparison. Values carry forward over each
-    # instrument's market holidays, but are not extended beyond its last actual quote.
+    #Use a common business-day axis for comparison. Values carry forward over each
+    #instrument's market holidays, but are not extended beyond its last actual quote.
     common_index = pd.date_range(start=start, end=max(series_last_dates.values()), freq="B", name="Datum")
     comparison = pd.DataFrame(index=common_index)
     for ticker, values in available_values.items():
@@ -732,7 +724,7 @@ def calculate_what_if_simulation(
         pos = int(prices.index.searchsorted(target, side="left"))
         if pos >= len(prices):
             # If the latest market close is only a few days old, use it for a
-            # contribution scheduled for today/a non-trading day at the end.
+            # contribution scheduled for today/a non-trading day at the end
             last_day = prices.index[-1]
             if planned_date <= today and (target - last_day).days <= 4:
                 pos = len(prices) - 1
@@ -746,7 +738,7 @@ def calculate_what_if_simulation(
             missed_dates.append(planned_date)
             continue
         # contribution_eur is converted at the historical FX rate; then units
-        # are valued with the local price and FX rate of each subsequent day.
+        # are valued with the local price and FX rate of each subsequent day
         units = float(contribution_eur) / (local_price * fx_rate)
         share_additions.loc[execution_date] += units
         cash_flows.loc[execution_date] += float(contribution_eur)
@@ -765,8 +757,8 @@ def calculate_what_if_simulation(
         "Investiertes Kapital (€)": invested.values,
         "Aktueller Wert (€)": value_eur.values,
     })
-    # Normally the chart begins on start_date. If the start date is today and
-    # Yahoo has not published a newer close yet, retain the latest close as proxy.
+ 
+    #chart start an start_date ausser keine neuen daten von yfinance
     chart_start = min(pd.Timestamp(start_date).normalize(), prices.index[-1])
     history = history[history["Datum"] >= chart_start].copy()
     history = history.replace([np.inf, -np.inf], np.nan).dropna(subset=["Aktueller Wert (€)"])
@@ -835,7 +827,7 @@ def build_return_heatmap_matrix(daily_returns: pd.Series, aggregation: str) -> p
             matrix.loc[int(year), week_names[int(week) - 1]] = value
         return matrix
 
-    # Daily view: calendar-aligned (month/day) columns, with one row per year.
+    # Daily view: calendar-aligned (month/day) columns, with one row per year
     years = sorted(int(y) for y in frame.index.year.unique())
     reference_dates = pd.date_range("2020-01-01", "2020-12-31", freq="D")
     day_names = [dt.strftime("%d.%m") for dt in reference_dates]
@@ -847,9 +839,7 @@ def build_return_heatmap_matrix(daily_returns: pd.Series, aggregation: str) -> p
     return matrix
 
 
-# ==========================================
 # 4. DATAFRAME / HISTORICAL PORTFOLIO ENGINE
-# ==========================================
 def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
     """Extract a single Close series from both single- and multi-level yfinance output."""
     if df is None or df.empty:
@@ -858,7 +848,7 @@ def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
     ticker = ticker.upper().strip()
     try:
         if isinstance(df.columns, pd.MultiIndex):
-            # Typical current yfinance layout: first level is price field.
+            # Typical current yfinance layout: first level is price field
             if "Close" in df.columns.get_level_values(0):
                 close_df = df["Close"]
                 if isinstance(close_df, pd.DataFrame):
@@ -871,7 +861,7 @@ def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
                     return pd.Series(dtype=float, name=ticker)
                 return close_df
 
-            # Fallback for the alternative orientation.
+            # Fallback für alternative orientation.
             if "Close" in df.columns.get_level_values(-1):
                 close_df = df.xs("Close", axis=1, level=-1)
                 if isinstance(close_df, pd.DataFrame):
@@ -936,8 +926,8 @@ def build_eur_return_matrix(
     if len(local_prices) < 2:
         return pd.DataFrame(), warnings + ["Es liegen weniger als zwei auswertbare Kursreihen vor."]
 
-    # Validate FX availability before determining the common period. Otherwise,
-    # a ticker that later gets excluded could unnecessarily shorten the sample.
+    #Validate FX availability before determining the common period Otherwise,
+    #a ticker that later gets excluded could unnecessarily shorten the sample
     fx_by_ticker: dict[str, pd.Series] = {}
     for ticker, prices in list(local_prices.items()):
         currency = currencies[ticker]
@@ -961,7 +951,7 @@ def build_eur_return_matrix(
     if len(local_prices) < 2:
         return pd.DataFrame(), warnings + ["Es liegen weniger als zwei auswertbare EUR-Zeitreihen vor."]
 
-    # Calculate only over the dates shared by all selected, available instruments.
+    #Calculate only over the dates shared by all selected, available instruments
     common_start = max(series.index.min() for series in local_prices.values())
     common_end = min(series.index.max() for series in local_prices.values())
     if common_start >= common_end:
@@ -1003,7 +993,7 @@ def normalize_trades(raw_trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row["Ticker"] = str(row.get("Ticker", "")).upper().strip()
         row["Buy Price"] = safe_float(row.get("Buy Price"))
         row["Quantity"] = safe_float(row.get("Quantity"))
-        # Existing projects used Date. Use it as fallback so old sessions keep working.
+        # Existing projects used Date. Use it as fallback so old sessions keep working
         row["Buy Date"] = as_trade_date(row.get("Buy Date") or row.get("Date"))
         row["Trade ID"] = str(row.get("Trade ID") or uuid4().hex)
         normalized.append(row)
@@ -1056,8 +1046,8 @@ def build_portfolio_dataframe(df_trades: pd.DataFrame) -> tuple[pd.DataFrame, li
         },
     ).reset_index()
     if tickers_with_incomplete_fx:
-        # A partial cost basis can distort P&L. Mark the EUR basis as unknown for
-        # the whole ticker if one or more of its purchase FX rates are unavailable.
+        # A partial cost basis can distort PnL. Mark the EUR basis as unknown for
+        # the whole ticker if one or more of its purchase FX rates are unavailable
         grouped.loc[
             grouped["Ticker"].isin(tickers_with_incomplete_fx), "Investierter Wert EUR"
         ] = np.nan
@@ -1139,7 +1129,6 @@ def build_portfolio_history(df_trades: pd.DataFrame) -> pd.DataFrame:
 
         quantities = pd.Series(0.0, index=portfolio_index)
         for _, trade in ticker_trades.iterrows():
-            # Once a trade has happened, its shares remain in the portfolio.
             trade_date = pd.Timestamp(as_trade_date(trade["Buy Date"])).normalize()
             quantities.loc[quantities.index >= trade_date] += safe_float(trade["Quantity"])
 
@@ -1180,9 +1169,7 @@ def filter_portfolio_history_by_interval(history_df: pd.DataFrame, interval: str
     return result
 
 
-# ==========================================
-# 5. NAVIGATION & DATENAUFBEREITUNG
-# ==========================================
+# 5. NAVIGATION
 st.sidebar.title("Navigation")
 st.sidebar.caption(APP_VERSION)
 NAV_OPTIONS = [
@@ -1202,11 +1189,11 @@ def sync_navigation_from_radio() -> None:
             st.session_state.detail_ticker = None
 
 
-# Use a stable widget key. Passing a changing ``index`` to an unkeyed radio can
+# Use a stable widget key. Passing a changing "index" to an unkeyed radio can
 # change its widget identity across reruns, which may make navigation feel like
-# it requires two clicks. Synchronize programmatic navigation (e.g. Detail button)
+# it requires two clicks. Synchronize programmatic navigation (zb Detail button)
 # before creating the radio, as Streamlit does not allow changing widget state
-# after that widget has been instantiated in the current run.
+# after that widget has been instantiated in the current run
 if st.session_state.current_page not in NAV_OPTIONS:
     st.session_state.current_page = NAV_OPTIONS[0]
 if (
@@ -1232,9 +1219,7 @@ portfolio_warnings: list[str] = []
 if not df_trades.empty:
     df_portfolio, portfolio_warnings = build_portfolio_dataframe(df_trades)
 
-# ==========================================
 # SEITE 1: PORTFOLIO ÜBERSICHT
-# ==========================================
 if page == "1. Portfolio Übersicht":
     st.title(" Portfolio Übersicht")
 
@@ -1358,11 +1343,9 @@ if page == "1. Portfolio Übersicht":
             },
         )
 
-# ==========================================
-# SEITE 2: MEINE POSITIONEN
-# ==========================================
+# SEITE 2: MEINE POSITIONEN / MyShares
 elif page == "2. Meine Positionen":
-    st.title("Meine Positionen")
+    st.title("MyShares")
 
     with st.expander("Neue Position / Tranche hinzufügen", expanded=True):
         col1, col2, col3, col4, col5 = st.columns([2.2, 2.8, 1.5, 1.5, 1.3])
@@ -1484,9 +1467,7 @@ elif page == "2. Meine Positionen":
     else:
         st.info("Noch keine Positionen vorhanden.")
 
-# ==========================================
 # SEITE 3: DETAILANSICHT
-# ==========================================
 elif page == "3. Detailansicht":
     st.title(" Detailansicht")
 
@@ -1585,11 +1566,9 @@ elif page == "3. Detailansicht":
                     else:
                         st.info("Keine Top-Holdings für dieses Instrument verfügbar.")
 
-# ==========================================
 # SEITE 4: RISK-O-METER
-# ==========================================
 elif page == "4. Risk-O-Meter":
-    st.title("Risk-O-Meter")
+    st.title("Risik-O-Meter")
 
     if len(df_portfolio) < 2:
         st.warning("Für eine Risiko- & Korrelationsbewertung werden mindestens 2 verschiedene Positionen benötigt.")
@@ -1700,9 +1679,7 @@ elif page == "4. Risk-O-Meter":
                         f"und trägt rechnerisch {max_risk_asset['Beitrag zum Risiko (%)']:.1f}% zur Gesamtschwankung bei."
                     )
 
-# ==========================================
 # SEITE 5: WHAT IF
-# ==========================================
 elif page == "5. What if":
     st.title("What if")
     st.caption(
