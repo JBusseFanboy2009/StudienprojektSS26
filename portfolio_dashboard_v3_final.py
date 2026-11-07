@@ -1189,11 +1189,7 @@ def sync_navigation_from_radio() -> None:
             st.session_state.detail_ticker = None
 
 
-# Use a stable widget key. Passing a changing "index" to an unkeyed radio can
-# change its widget identity across reruns, which may make navigation feel like
-# it requires two clicks. Synchronize programmatic navigation (zb Detail button)
-# before creating the radio, as Streamlit does not allow changing widget state
-# after that widget has been instantiated in the current run
+
 if st.session_state.current_page not in NAV_OPTIONS:
     st.session_state.current_page = NAV_OPTIONS[0]
 if (
