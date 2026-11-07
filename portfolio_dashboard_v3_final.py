@@ -1345,7 +1345,7 @@ if page == "1. Portfolio Übersicht":
 
 # SEITE 2: MEINE POSITIONEN / MyShares
 elif page == "2. Meine Positionen":
-    st.title("MyShares")
+    st.title("MyShares123")
 
     with st.expander("Neue Position / Tranche hinzufügen", expanded=True):
         col1, col2, col3, col4, col5 = st.columns([2.2, 2.8, 1.5, 1.5, 1.3])
