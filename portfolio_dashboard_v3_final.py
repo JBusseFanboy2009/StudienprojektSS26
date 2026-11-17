@@ -11,8 +11,11 @@ from uuid import uuid4
 from yahooquery import Ticker as YQTicker
 from yahooquery import search as yahoo_search
 
-APP_VERSION = "Finale Version"
+APP_VERSION = "3.4.1 – ETF-Aufschlüsselung repariert"
 
+# ==========================================
+# 1. SETUP & SESSION STATE
+# ==========================================
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
 if "trades" not in st.session_state:
@@ -23,18 +26,50 @@ if "current_page" not in st.session_state:
 if "detail_ticker" not in st.session_state:
     st.session_state.detail_ticker = None
 
+# ==========================================
+# 2. HILFS- & NORMALISIERUNGSFUNKTIONEN
+# ==========================================
+def unwrap_yahoo_value(value: Any) -> Any:
+    """Extract the scalar from Yahoo Finance's {raw, fmt, longFmt} objects."""
+    for _ in range(3):
+        if not isinstance(value, dict):
+            break
+        next_value = None
+        for key in ("raw", "value", "fmt", "longFmt"):
+            candidate = value.get(key)
+            if candidate is not None:
+                next_value = candidate
+                break
+        if next_value is None:
+            return None
+        value = next_value
+    return value
 
-def normalize_weight_pct(value: Any) -> float | None:
+
+def yahoo_number(value: Any) -> float | None:
+    """Safely convert a Yahoo value to a finite float without changing units."""
+    value = unwrap_yahoo_value(value)
     if value is None:
         return None
+    if isinstance(value, str):
+        value = value.strip().replace("%", "").replace(" ", "").replace(",", ".")
+        if not value:
+            return None
     try:
-        v = float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return None
-    if not np.isfinite(v):
+    return result if np.isfinite(result) else None
+
+
+def normalize_weight_pct(value: Any) -> float | None:
+    """Convert Yahoo weight values to percent (accepting raw and formatted forms)."""
+    v = yahoo_number(value)
+    if v is None:
         return None
+    # Yahoo frequently represents 5.2% as the fractional value 0.052.
     if 0 < abs(v) <= 1.0:
-        return v * 100.0
+        v *= 100.0
     return v
 
 
@@ -126,7 +161,9 @@ def delete_all_trades_for_ticker(ticker: str) -> None:
 
 ensure_trade_ids()
 
-#DATEN-ABFRAGEN
+# ==========================================
+# 3. DATEN-ABFRAGEN
+# ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_ticker(query: str) -> list[str]:
     if not query or len(query.strip()) < 2:
@@ -179,7 +216,8 @@ def get_instrument_currency(ticker: str) -> str:
     except Exception:
         pass
 
-    #EUR Notlösung
+    # Last-resort fallback. EUR keeps the dashboard usable even if metadata
+    # is temporarily unavailable. A visible warning is shown at portfolio level.
     return "EUR"
 
 
@@ -255,8 +293,8 @@ def get_current_fx_rate(currency: str) -> float | None:
     if currency == "EUR":
         return 1.0
 
-    direct_pair = f"EUR{currency}=X"      # andere currency pro EUR
-    inverse_pair = f"{currency}EUR=X"     # EUR pro andere currency
+    direct_pair = f"EUR{currency}=X"      # foreign currency per EUR
+    inverse_pair = f"{currency}EUR=X"     # EUR per foreign currency
 
     for pair, inverse in ((direct_pair, True), (inverse_pair, False)):
         try:
@@ -371,28 +409,31 @@ def get_fundamentals_yq(ticker: str) -> dict[str, Any]:
             res["long_name"] = qtype_dict.get("shortName") or qtype_dict.get("longName") or ticker
 
         if isinstance(summary, dict):
-            pe = summary.get("trailingPE")
-            if pe is not None and isinstance(pe, (int, float)):
+            pe = yahoo_number(summary.get("trailingPE"))
+            if pe is not None:
                 res["pe"] = f"{pe:.2f}"
 
-            dy = summary.get("dividendYield") or summary.get("yield")
-            if dy is not None and isinstance(dy, (int, float)):
+            dy_raw = summary.get("dividendYield")
+            if dy_raw is None:
+                dy_raw = summary.get("yield")
+            dy = yahoo_number(dy_raw)
+            if dy is not None:
                 res["div_yield"] = f"{dy * 100:.2f}%" if dy <= 1.0 else f"{dy:.2f}%"
 
-            mc = summary.get("marketCap")
-            if mc is not None and isinstance(mc, (int, float)):
+            mc = yahoo_number(summary.get("marketCap"))
+            if mc is not None:
                 res["market_cap"] = f"{mc / 1e9:.2f} Mrd."
 
-            ta = summary.get("totalAssets")
-            if ta is not None and isinstance(ta, (int, float)):
+            ta = yahoo_number(summary.get("totalAssets"))
+            if ta is not None:
                 res["total_assets"] = f"{ta / 1e6:.2f} Mio."
 
         if isinstance(fund_prof, dict):
             fees = fund_prof.get("feesExpensesInvestment", {})
             if isinstance(fees, dict):
-                er = fees.get("annualReportExpenseRatio")
+                er = yahoo_number(fees.get("annualReportExpenseRatio"))
                 if er is not None:
-                    res["expense_ratio"] = f"{er * 100:.2f}%"
+                    res["expense_ratio"] = f"{er * 100:.2f}%" if er <= 1.0 else f"{er:.2f}%"
 
         if res["div_yield"] != "N/A":
             res["dist_policy"] = "Ausschüttend (Distributing)"
@@ -409,40 +450,147 @@ def get_fundamentals_yq(ticker: str) -> dict[str, Any]:
     return res
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_etf_breakdown_yq(ticker: str) -> tuple[dict[str, float], dict[str, float]]:
-    sectors, top_holdings = {}, {}
-    try:
-        yq = YQTicker(ticker)
-        raw = getattr(yq, "fund_holding_info", None)
-        if isinstance(raw, dict) and ticker in raw:
-            fund_data = raw[ticker]
-            if isinstance(fund_data, dict):
-                sec_raw = fund_data.get("sectorWeightings")
-                if isinstance(sec_raw, list):
-                    for item in sec_raw:
-                        if isinstance(item, dict):
-                            for k, v in item.items():
-                                val = normalize_weight_pct(v)
-                                if val is not None:
-                                    sectors[humanize_sector_key(str(k))] = val
-                elif isinstance(sec_raw, dict):
-                    for k, v in sec_raw.items():
-                        val = normalize_weight_pct(v)
-                        if val is not None:
-                            sectors[humanize_sector_key(str(k))] = val
+    """Load ETF sector weights and top holdings from Yahoo Finance.
 
-                holdings_raw = fund_data.get("holdings")
-                if isinstance(holdings_raw, list):
-                    for row in holdings_raw:
-                        if isinstance(row, dict):
-                            name = row.get("holdingName") or row.get("symbol") or "Holding"
-                            pct = row.get("holdingPercent") or row.get("pctOfPortfolio")
-                            val = normalize_weight_pct(pct)
-                            if val is not None:
-                                top_holdings[str(name)] = val
+    Primary source: the current yfinance ``Ticker.funds_data`` interface.
+    Fallback: yahooquery's ``fund_holding_info``. Both sources can return
+    percentage fields as Yahoo's {raw, fmt} objects, which are normalized by
+    ``normalize_weight_pct`` above.
+    """
+    ticker = str(ticker).upper().strip()
+    sectors: dict[str, float] = {}
+    top_holdings: dict[str, float] = {}
+
+    def add_sector_rows(raw: Any) -> None:
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                val = normalize_weight_pct(value)
+                if val is not None:
+                    sectors[humanize_sector_key(str(key))] = val
+        elif isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        val = normalize_weight_pct(value)
+                        if val is not None:
+                            sectors[humanize_sector_key(str(key))] = val
+
+    def first_present(*values: Any) -> Any:
+        for candidate in values:
+            if candidate is None:
+                continue
+            try:
+                missing = pd.isna(candidate)
+                if isinstance(missing, (bool, np.bool_)) and missing:
+                    continue
+            except Exception:
+                pass
+            if str(candidate).strip() and str(candidate).strip().lower() not in {"nan", "none", "<na>"}:
+                return candidate
+        return None
+
+    def add_holding_row(name: Any, pct: Any) -> None:
+        name = first_present(name)
+        if name is None:
+            return
+        val = normalize_weight_pct(pct)
+        if val is None:
+            return
+        label = str(name).strip()
+        if label and label.lower() not in {"nan", "none"}:
+            top_holdings[label] = val
+
+    def add_holding_rows(raw: Any) -> None:
+        # Current yfinance returns a DataFrame indexed by Symbol with columns
+        # like "Name" and "Holding Percent".
+        if isinstance(raw, pd.DataFrame):
+            for idx, row in raw.iterrows():
+                row_values = {str(k).strip().lower().replace("_", " "): v for k, v in row.items()}
+                name = first_present(
+                    row_values.get("name"),
+                    row_values.get("holding name"),
+                    row_values.get("holdingname"),
+                    row_values.get("symbol"),
+                    idx,
+                )
+                pct = (
+                    row_values.get("holding percent")
+                    if "holding percent" in row_values
+                    else row_values.get("holdingpercent")
+                )
+                if pct is None:
+                    pct = first_present(
+                        row_values.get("holding percentage"),
+                        row_values.get("pct of portfolio"),
+                    )
+                add_holding_row(name, pct)
+            return
+
+        if isinstance(raw, list):
+            for row in raw:
+                if not isinstance(row, dict):
+                    continue
+                name = first_present(row.get("holdingName"), row.get("name"), row.get("symbol"))
+                pct = row.get("holdingPercent")
+                if pct is None:
+                    pct = first_present(row.get("pctOfPortfolio"), row.get("holding percent"))
+                add_holding_row(name, pct)
+            return
+
+        if isinstance(raw, dict):
+            # Also accept a single holding record or a symbol -> holding mapping.
+            if any(k in raw for k in ("holdingPercent", "holding percent", "pctOfPortfolio")):
+                name = first_present(raw.get("holdingName"), raw.get("name"), raw.get("symbol"))
+                pct = raw.get("holdingPercent")
+                if pct is None:
+                    pct = first_present(raw.get("pctOfPortfolio"), raw.get("holding percent"))
+                add_holding_row(name, pct)
+            else:
+                for symbol, row in raw.items():
+                    if isinstance(row, dict):
+                        name = first_present(row.get("holdingName"), row.get("name"), row.get("symbol"), symbol)
+                        pct = row.get("holdingPercent")
+                        if pct is None:
+                            pct = first_present(row.get("pctOfPortfolio"), row.get("holding percent"))
+                        add_holding_row(name, pct)
+
+    # 1) Current yfinance API. It exposes sector_weightings as a dictionary
+    #    and top_holdings as a DataFrame.
+    try:
+        fund_api = getattr(yf.Ticker(ticker), "funds_data", None)
+        if fund_api is not None:
+            add_sector_rows(getattr(fund_api, "sector_weightings", None))
+            add_holding_rows(getattr(fund_api, "top_holdings", None))
     except Exception:
+        # Continue with yahooquery; an API or library-version issue in one
+        # provider should not hide data that the other provider can return.
         pass
+
+    # 2) Compatibility fallback for yahooquery and older cached projects.
+    if not sectors or not top_holdings:
+        try:
+            yq = YQTicker(ticker)
+            raw = getattr(yq, "fund_holding_info", None)
+            fund_data = None
+            if isinstance(raw, dict):
+                # Be tolerant of ticker casing and single-ticker response shapes.
+                for key, value in raw.items():
+                    if str(key).upper() == ticker:
+                        fund_data = value
+                        break
+                if fund_data is None and len(raw) == 1:
+                    fund_data = next(iter(raw.values()))
+
+            if isinstance(fund_data, dict):
+                if not sectors:
+                    add_sector_rows(fund_data.get("sectorWeightings"))
+                if not top_holdings:
+                    add_holding_rows(fund_data.get("holdings"))
+        except Exception:
+            pass
+
     return sectors, top_holdings
 
 
@@ -564,7 +712,7 @@ def calculate_investment_comparison(
             warnings.append(f"{ticker}: Kein verlässlicher historischer Wechselkurs für {currency}; Wertpapier übersprungen.")
             continue
 
-        #Buy same EUR amount at first available close after selected start date.
+        # Buy the same EUR amount at the first available close on/after the selected start date.
         first_price = safe_float(prices.iloc[0], np.nan)
         first_fx = safe_float(fx.iloc[0], np.nan)
         if not np.isfinite(first_price) or first_price <= 0 or not np.isfinite(first_fx) or first_fx <= 0:
@@ -595,8 +743,8 @@ def calculate_investment_comparison(
     if not available_values:
         return pd.DataFrame(), pd.DataFrame(), warnings or ["Für die ausgewählten Wertpapiere sind keine Daten verfügbar."]
 
-    #Use a common business-day axis for comparison. Values carry forward over each
-    #instrument's market holidays, but are not extended beyond its last actual quote.
+    # Use a common business-day axis for comparison. Values carry forward over each
+    # instrument's market holidays, but are not extended beyond its last actual quote.
     common_index = pd.date_range(start=start, end=max(series_last_dates.values()), freq="B", name="Datum")
     comparison = pd.DataFrame(index=common_index)
     for ticker, values in available_values.items():
@@ -724,7 +872,7 @@ def calculate_what_if_simulation(
         pos = int(prices.index.searchsorted(target, side="left"))
         if pos >= len(prices):
             # If the latest market close is only a few days old, use it for a
-            # contribution scheduled for today/a non-trading day at the end
+            # contribution scheduled for today/a non-trading day at the end.
             last_day = prices.index[-1]
             if planned_date <= today and (target - last_day).days <= 4:
                 pos = len(prices) - 1
@@ -738,7 +886,7 @@ def calculate_what_if_simulation(
             missed_dates.append(planned_date)
             continue
         # contribution_eur is converted at the historical FX rate; then units
-        # are valued with the local price and FX rate of each subsequent day
+        # are valued with the local price and FX rate of each subsequent day.
         units = float(contribution_eur) / (local_price * fx_rate)
         share_additions.loc[execution_date] += units
         cash_flows.loc[execution_date] += float(contribution_eur)
@@ -757,8 +905,8 @@ def calculate_what_if_simulation(
         "Investiertes Kapital (€)": invested.values,
         "Aktueller Wert (€)": value_eur.values,
     })
- 
-    #chart start an start_date ausser keine neuen daten von yfinance
+    # Normally the chart begins on start_date. If the start date is today and
+    # Yahoo has not published a newer close yet, retain the latest close as proxy.
     chart_start = min(pd.Timestamp(start_date).normalize(), prices.index[-1])
     history = history[history["Datum"] >= chart_start].copy()
     history = history.replace([np.inf, -np.inf], np.nan).dropna(subset=["Aktueller Wert (€)"])
@@ -827,7 +975,7 @@ def build_return_heatmap_matrix(daily_returns: pd.Series, aggregation: str) -> p
             matrix.loc[int(year), week_names[int(week) - 1]] = value
         return matrix
 
-    # Daily view: calendar-aligned (month/day) columns, with one row per year
+    # Daily view: calendar-aligned (month/day) columns, with one row per year.
     years = sorted(int(y) for y in frame.index.year.unique())
     reference_dates = pd.date_range("2020-01-01", "2020-12-31", freq="D")
     day_names = [dt.strftime("%d.%m") for dt in reference_dates]
@@ -839,7 +987,9 @@ def build_return_heatmap_matrix(daily_returns: pd.Series, aggregation: str) -> p
     return matrix
 
 
+# ==========================================
 # 4. DATAFRAME / HISTORICAL PORTFOLIO ENGINE
+# ==========================================
 def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
     """Extract a single Close series from both single- and multi-level yfinance output."""
     if df is None or df.empty:
@@ -848,7 +998,7 @@ def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
     ticker = ticker.upper().strip()
     try:
         if isinstance(df.columns, pd.MultiIndex):
-            # Typical current yfinance layout: first level is price field
+            # Typical current yfinance layout: first level is price field.
             if "Close" in df.columns.get_level_values(0):
                 close_df = df["Close"]
                 if isinstance(close_df, pd.DataFrame):
@@ -861,7 +1011,7 @@ def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
                     return pd.Series(dtype=float, name=ticker)
                 return close_df
 
-            # Fallback für alternative orientation.
+            # Fallback for the alternative orientation.
             if "Close" in df.columns.get_level_values(-1):
                 close_df = df.xs("Close", axis=1, level=-1)
                 if isinstance(close_df, pd.DataFrame):
@@ -926,8 +1076,8 @@ def build_eur_return_matrix(
     if len(local_prices) < 2:
         return pd.DataFrame(), warnings + ["Es liegen weniger als zwei auswertbare Kursreihen vor."]
 
-    #Validate FX availability before determining the common period Otherwise,
-    #a ticker that later gets excluded could unnecessarily shorten the sample
+    # Validate FX availability before determining the common period. Otherwise,
+    # a ticker that later gets excluded could unnecessarily shorten the sample.
     fx_by_ticker: dict[str, pd.Series] = {}
     for ticker, prices in list(local_prices.items()):
         currency = currencies[ticker]
@@ -951,7 +1101,7 @@ def build_eur_return_matrix(
     if len(local_prices) < 2:
         return pd.DataFrame(), warnings + ["Es liegen weniger als zwei auswertbare EUR-Zeitreihen vor."]
 
-    #Calculate only over the dates shared by all selected, available instruments
+    # Calculate only over the dates shared by all selected, available instruments.
     common_start = max(series.index.min() for series in local_prices.values())
     common_end = min(series.index.max() for series in local_prices.values())
     if common_start >= common_end:
@@ -993,7 +1143,7 @@ def normalize_trades(raw_trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
         row["Ticker"] = str(row.get("Ticker", "")).upper().strip()
         row["Buy Price"] = safe_float(row.get("Buy Price"))
         row["Quantity"] = safe_float(row.get("Quantity"))
-        # Existing projects used Date. Use it as fallback so old sessions keep working
+        # Existing projects used Date. Use it as fallback so old sessions keep working.
         row["Buy Date"] = as_trade_date(row.get("Buy Date") or row.get("Date"))
         row["Trade ID"] = str(row.get("Trade ID") or uuid4().hex)
         normalized.append(row)
@@ -1046,8 +1196,8 @@ def build_portfolio_dataframe(df_trades: pd.DataFrame) -> tuple[pd.DataFrame, li
         },
     ).reset_index()
     if tickers_with_incomplete_fx:
-        # A partial cost basis can distort PnL. Mark the EUR basis as unknown for
-        # the whole ticker if one or more of its purchase FX rates are unavailable
+        # A partial cost basis can distort P&L. Mark the EUR basis as unknown for
+        # the whole ticker if one or more of its purchase FX rates are unavailable.
         grouped.loc[
             grouped["Ticker"].isin(tickers_with_incomplete_fx), "Investierter Wert EUR"
         ] = np.nan
@@ -1129,6 +1279,7 @@ def build_portfolio_history(df_trades: pd.DataFrame) -> pd.DataFrame:
 
         quantities = pd.Series(0.0, index=portfolio_index)
         for _, trade in ticker_trades.iterrows():
+            # Once a trade has happened, its shares remain in the portfolio.
             trade_date = pd.Timestamp(as_trade_date(trade["Buy Date"])).normalize()
             quantities.loc[quantities.index >= trade_date] += safe_float(trade["Quantity"])
 
@@ -1169,7 +1320,9 @@ def filter_portfolio_history_by_interval(history_df: pd.DataFrame, interval: str
     return result
 
 
-# 5. NAVIGATION
+# ==========================================
+# 5. NAVIGATION & DATENAUFBEREITUNG
+# ==========================================
 st.sidebar.title("Navigation")
 st.sidebar.caption(APP_VERSION)
 NAV_OPTIONS = [
@@ -1189,7 +1342,11 @@ def sync_navigation_from_radio() -> None:
             st.session_state.detail_ticker = None
 
 
-
+# Use a stable widget key. Passing a changing ``index`` to an unkeyed radio can
+# change its widget identity across reruns, which may make navigation feel like
+# it requires two clicks. Synchronize programmatic navigation (e.g. Detail button)
+# before creating the radio, as Streamlit does not allow changing widget state
+# after that widget has been instantiated in the current run.
 if st.session_state.current_page not in NAV_OPTIONS:
     st.session_state.current_page = NAV_OPTIONS[0]
 if (
@@ -1215,7 +1372,9 @@ portfolio_warnings: list[str] = []
 if not df_trades.empty:
     df_portfolio, portfolio_warnings = build_portfolio_dataframe(df_trades)
 
+# ==========================================
 # SEITE 1: PORTFOLIO ÜBERSICHT
+# ==========================================
 if page == "1. Portfolio Übersicht":
     st.title(" Portfolio Übersicht")
 
@@ -1339,9 +1498,11 @@ if page == "1. Portfolio Übersicht":
             },
         )
 
-# SEITE 2: MEINE POSITIONEN / MyShares
+# ==========================================
+# SEITE 2: MEINE POSITIONEN
+# ==========================================
 elif page == "2. Meine Positionen":
-    st.title("MyShares")
+    st.title("Meine Positionen")
 
     with st.expander("Neue Position / Tranche hinzufügen", expanded=True):
         col1, col2, col3, col4, col5 = st.columns([2.2, 2.8, 1.5, 1.5, 1.3])
@@ -1463,7 +1624,9 @@ elif page == "2. Meine Positionen":
     else:
         st.info("Noch keine Positionen vorhanden.")
 
+# ==========================================
 # SEITE 3: DETAILANSICHT
+# ==========================================
 elif page == "3. Detailansicht":
     st.title(" Detailansicht")
 
@@ -1481,7 +1644,7 @@ elif page == "3. Detailansicht":
         if selected_asset:
             fund_data = get_fundamentals_yq(selected_asset)
             sectors, top_holdings = get_etf_breakdown_yq(selected_asset)
-            is_etf = fund_data["quote_type"] == "ETF" or len(sectors) > 0 or len(top_holdings) > 0
+            is_etf = str(fund_data["quote_type"]).upper() in {"ETF", "MUTUALFUND", "MUTUAL FUND", "FUND"} or len(sectors) > 0 or len(top_holdings) > 0
             asset_currency = get_instrument_currency(selected_asset)
 
             st.caption(
@@ -1562,9 +1725,11 @@ elif page == "3. Detailansicht":
                     else:
                         st.info("Keine Top-Holdings für dieses Instrument verfügbar.")
 
+# ==========================================
 # SEITE 4: RISK-O-METER
+# ==========================================
 elif page == "4. Risk-O-Meter":
-    st.title("Risik-O-Meter")
+    st.title("Risk-O-Meter")
 
     if len(df_portfolio) < 2:
         st.warning("Für eine Risiko- & Korrelationsbewertung werden mindestens 2 verschiedene Positionen benötigt.")
@@ -1675,7 +1840,9 @@ elif page == "4. Risk-O-Meter":
                         f"und trägt rechnerisch {max_risk_asset['Beitrag zum Risiko (%)']:.1f}% zur Gesamtschwankung bei."
                     )
 
+# ==========================================
 # SEITE 5: WHAT IF
+# ==========================================
 elif page == "5. What if":
     st.title("What if")
     st.caption(
