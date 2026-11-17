@@ -13,9 +13,6 @@ from yahooquery import search as yahoo_search
 
 APP_VERSION = "3.4.1 – ETF-Aufschlüsselung repariert"
 
-# ==========================================
-# 1. SETUP & SESSION STATE
-# ==========================================
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
 if "trades" not in st.session_state:
@@ -26,9 +23,6 @@ if "current_page" not in st.session_state:
 if "detail_ticker" not in st.session_state:
     st.session_state.detail_ticker = None
 
-# ==========================================
-# 2. HILFS- & NORMALISIERUNGSFUNKTIONEN
-# ==========================================
 def unwrap_yahoo_value(value: Any) -> Any:
     """Extract the scalar from Yahoo Finance's {raw, fmt, longFmt} objects."""
     for _ in range(3):
@@ -161,9 +155,6 @@ def delete_all_trades_for_ticker(ticker: str) -> None:
 
 ensure_trade_ids()
 
-# ==========================================
-# 3. DATEN-ABFRAGEN
-# ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def search_ticker(query: str) -> list[str]:
     if not query or len(query.strip()) < 2:
@@ -987,9 +978,6 @@ def build_return_heatmap_matrix(daily_returns: pd.Series, aggregation: str) -> p
     return matrix
 
 
-# ==========================================
-# 4. DATAFRAME / HISTORICAL PORTFOLIO ENGINE
-# ==========================================
 def extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
     """Extract a single Close series from both single- and multi-level yfinance output."""
     if df is None or df.empty:
@@ -1320,9 +1308,6 @@ def filter_portfolio_history_by_interval(history_df: pd.DataFrame, interval: str
     return result
 
 
-# ==========================================
-# 5. NAVIGATION & DATENAUFBEREITUNG
-# ==========================================
 st.sidebar.title("Navigation")
 st.sidebar.caption(APP_VERSION)
 NAV_OPTIONS = [
@@ -1372,9 +1357,6 @@ portfolio_warnings: list[str] = []
 if not df_trades.empty:
     df_portfolio, portfolio_warnings = build_portfolio_dataframe(df_trades)
 
-# ==========================================
-# SEITE 1: PORTFOLIO ÜBERSICHT
-# ==========================================
 if page == "1. Portfolio Übersicht":
     st.title(" Portfolio Übersicht")
 
@@ -1498,11 +1480,9 @@ if page == "1. Portfolio Übersicht":
             },
         )
 
-# ==========================================
-# SEITE 2: MEINE POSITIONEN
-# ==========================================
+
 elif page == "2. Meine Positionen":
-    st.title("Meine Positionen")
+    st.title("MyShares")
 
     with st.expander("Neue Position / Tranche hinzufügen", expanded=True):
         col1, col2, col3, col4, col5 = st.columns([2.2, 2.8, 1.5, 1.5, 1.3])
@@ -1624,9 +1604,6 @@ elif page == "2. Meine Positionen":
     else:
         st.info("Noch keine Positionen vorhanden.")
 
-# ==========================================
-# SEITE 3: DETAILANSICHT
-# ==========================================
 elif page == "3. Detailansicht":
     st.title(" Detailansicht")
 
@@ -1725,11 +1702,9 @@ elif page == "3. Detailansicht":
                     else:
                         st.info("Keine Top-Holdings für dieses Instrument verfügbar.")
 
-# ==========================================
-# SEITE 4: RISK-O-METER
-# ==========================================
+
 elif page == "4. Risk-O-Meter":
-    st.title("Risk-O-Meter")
+    st.title("Risik-O-Meter")
 
     if len(df_portfolio) < 2:
         st.warning("Für eine Risiko- & Korrelationsbewertung werden mindestens 2 verschiedene Positionen benötigt.")
@@ -1840,9 +1815,7 @@ elif page == "4. Risk-O-Meter":
                         f"und trägt rechnerisch {max_risk_asset['Beitrag zum Risiko (%)']:.1f}% zur Gesamtschwankung bei."
                     )
 
-# ==========================================
-# SEITE 5: WHAT IF
-# ==========================================
+
 elif page == "5. What if":
     st.title("What if")
     st.caption(
