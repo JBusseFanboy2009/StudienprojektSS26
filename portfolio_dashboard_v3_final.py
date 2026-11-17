@@ -11,7 +11,7 @@ from uuid import uuid4
 from yahooquery import Ticker as YQTicker
 from yahooquery import search as yahoo_search
 
-APP_VERSION = "final"
+APP_VERSION = "Studienprojekt SS26"
 
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
