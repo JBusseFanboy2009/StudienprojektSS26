@@ -11,7 +11,7 @@ from uuid import uuid4
 from yahooquery import Ticker as YQTicker
 from yahooquery import search as yahoo_search
 
-APP_VERSION = "3.4.1 – ETF-Aufschlüsselung repariert"
+APP_VERSION = "final"
 
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
