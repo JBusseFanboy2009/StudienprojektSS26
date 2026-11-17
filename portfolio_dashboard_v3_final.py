@@ -11,7 +11,7 @@ from uuid import uuid4
 from yahooquery import Ticker as YQTicker
 from yahooquery import search as yahoo_search
 
-APP_VERSION = "3.4.2 – ETF-Daten für Cloud stabilisiert"
+APP_VERSION = "3.4.1 – ETF-Aufschlüsselung repariert"
 
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
@@ -57,12 +57,12 @@ def yahoo_number(value: Any) -> float | None:
 
 
 def normalize_weight_pct(value: Any) -> float | None:
-    raw_value = unwrap_yahoo_value(value)
-    explicit_percent = isinstance(raw_value, str) and "%" in raw_value
-    v = yahoo_number(raw_value)
+    """Convert Yahoo weight values to percent (accepting raw and formatted forms)."""
+    v = yahoo_number(value)
     if v is None:
         return None
-    if not explicit_percent and 0 < abs(v) <= 1.0:
+    # Yahoo frequently represents 5.2% as the fractional value 0.052.
+    if 0 < abs(v) <= 1.0:
         v *= 100.0
     return v
 
@@ -389,16 +389,15 @@ def get_fundamentals_yq(ticker: str) -> dict[str, Any]:
         "quote_type": "EQUITY",
         "long_name": ticker,
     }
-
     try:
-        yq = YQTicker(ticker, asynchronous=False)
+        yq = YQTicker(ticker)
         summary = yq.summary_detail.get(ticker, {}) if isinstance(yq.summary_detail, dict) else {}
         qtype_dict = yq.quote_type.get(ticker, {}) if isinstance(yq.quote_type, dict) else {}
         fund_prof = yq.fund_profile.get(ticker, {}) if isinstance(yq.fund_profile, dict) else {}
 
         if isinstance(qtype_dict, dict):
-            res["quote_type"] = qtype_dict.get("quoteType", res["quote_type"])
-            res["long_name"] = qtype_dict.get("shortName") or qtype_dict.get("longName") or res["long_name"]
+            res["quote_type"] = qtype_dict.get("quoteType", "EQUITY")
+            res["long_name"] = qtype_dict.get("shortName") or qtype_dict.get("longName") or ticker
 
         if isinstance(summary, dict):
             pe = yahoo_number(summary.get("trailingPE"))
@@ -426,67 +425,34 @@ def get_fundamentals_yq(ticker: str) -> dict[str, Any]:
                 er = yahoo_number(fees.get("annualReportExpenseRatio"))
                 if er is not None:
                     res["expense_ratio"] = f"{er * 100:.2f}%" if er <= 1.0 else f"{er:.2f}%"
+
+        if res["div_yield"] != "N/A":
+            res["dist_policy"] = "Ausschüttend (Distributing)"
+        else:
+            name = res["long_name"].upper()
+            if "ACC" in name or " C " in name:
+                res["dist_policy"] = "Thesaurierend (Accumulating)"
+            elif "DIST" in name or " D " in name or "INC" in name:
+                res["dist_policy"] = "Ausschüttend (Distributing)"
+            elif res["quote_type"] == "ETF":
+                res["dist_policy"] = "Thesaurierend (Accumulating)"
     except Exception:
         pass
-
-    if res["quote_type"] == "EQUITY" or res["long_name"] == ticker:
-        try:
-            info = yf.Ticker(ticker).get_info()
-            if isinstance(info, dict):
-                qtype = info.get("quoteType")
-                if qtype:
-                    res["quote_type"] = str(qtype).upper()
-                res["long_name"] = info.get("longName") or info.get("shortName") or res["long_name"]
-                if res["total_assets"] == "N/A":
-                    total_assets = yahoo_number(info.get("totalAssets"))
-                    if total_assets is not None:
-                        res["total_assets"] = f"{total_assets / 1e6:.2f} Mio."
-                if res["div_yield"] == "N/A":
-                    dividend_yield = yahoo_number(info.get("dividendYield"))
-                    if dividend_yield is not None:
-                        res["div_yield"] = f"{dividend_yield * 100:.2f}%" if dividend_yield <= 1.0 else f"{dividend_yield:.2f}%"
-                if res["market_cap"] == "N/A":
-                    market_cap = yahoo_number(info.get("marketCap"))
-                    if market_cap is not None:
-                        res["market_cap"] = f"{market_cap / 1e9:.2f} Mrd."
-        except Exception:
-            pass
-
-    if res["div_yield"] != "N/A":
-        res["dist_policy"] = "Ausschüttend (Distributing)"
-    else:
-        name = res["long_name"].upper()
-        if "ACC" in name or " C " in name:
-            res["dist_policy"] = "Thesaurierend (Accumulating)"
-        elif "DIST" in name or " D " in name or "INC" in name:
-            res["dist_policy"] = "Ausschüttend (Distributing)"
-        elif str(res["quote_type"]).upper() in {"ETF", "MUTUALFUND", "MUTUAL FUND", "FUND"}:
-            res["dist_policy"] = "Thesaurierend (Accumulating)"
     return res
 
 
-def _parse_etf_breakdown(ticker: str) -> tuple[dict[str, float], dict[str, float], list[str], list[str], bool]:
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_etf_breakdown_yq(ticker: str) -> tuple[dict[str, float], dict[str, float]]:
+    """Load ETF sector weights and top holdings from Yahoo Finance.
+
+    Primary source: the current yfinance ``Ticker.funds_data`` interface.
+    Fallback: yahooquery's ``fund_holding_info``. Both sources can return
+    percentage fields as Yahoo's {raw, fmt} objects, which are normalized by
+    ``normalize_weight_pct`` above.
+    """
     ticker = str(ticker).upper().strip()
     sectors: dict[str, float] = {}
     top_holdings: dict[str, float] = {}
-    sources: list[str] = []
-    errors: list[str] = []
-    fund_detected = False
-
-    def first_present(*values: Any) -> Any:
-        for candidate in values:
-            if candidate is None:
-                continue
-            try:
-                missing = pd.isna(candidate)
-                if isinstance(missing, (bool, np.bool_)) and missing:
-                    continue
-            except Exception:
-                pass
-            text_value = str(candidate).strip()
-            if text_value and text_value.lower() not in {"nan", "none", "<na>"}:
-                return candidate
-        return None
 
     def add_sector_rows(raw: Any) -> None:
         if isinstance(raw, dict):
@@ -502,37 +468,54 @@ def _parse_etf_breakdown(ticker: str) -> tuple[dict[str, float], dict[str, float
                         if val is not None:
                             sectors[humanize_sector_key(str(key))] = val
 
+    def first_present(*values: Any) -> Any:
+        for candidate in values:
+            if candidate is None:
+                continue
+            try:
+                missing = pd.isna(candidate)
+                if isinstance(missing, (bool, np.bool_)) and missing:
+                    continue
+            except Exception:
+                pass
+            if str(candidate).strip() and str(candidate).strip().lower() not in {"nan", "none", "<na>"}:
+                return candidate
+        return None
+
     def add_holding_row(name: Any, pct: Any) -> None:
         name = first_present(name)
+        if name is None:
+            return
         val = normalize_weight_pct(pct)
-        if name is None or val is None:
+        if val is None:
             return
         label = str(name).strip()
-        if label and label.lower() not in {"nan", "none", "<na>"}:
+        if label and label.lower() not in {"nan", "none"}:
             top_holdings[label] = val
 
     def add_holding_rows(raw: Any) -> None:
+        # Current yfinance returns a DataFrame indexed by Symbol with columns
+        # like "Name" and "Holding Percent".
         if isinstance(raw, pd.DataFrame):
             for idx, row in raw.iterrows():
-                row_values = {
-                    str(key).strip().lower().replace("_", " ").replace("-", " "): value
-                    for key, value in row.items()
-                }
+                row_values = {str(k).strip().lower().replace("_", " "): v for k, v in row.items()}
                 name = first_present(
                     row_values.get("name"),
                     row_values.get("holding name"),
-                    row_values.get("security"),
+                    row_values.get("holdingname"),
                     row_values.get("symbol"),
                     idx,
                 )
-                pct = first_present(
-                    row_values.get("holding percent"),
-                    row_values.get("holding percentage"),
-                    row_values.get("holdingpercent"),
-                    row_values.get("pct of portfolio"),
-                    row_values.get("weight"),
-                    row_values.get("percent"),
+                pct = (
+                    row_values.get("holding percent")
+                    if "holding percent" in row_values
+                    else row_values.get("holdingpercent")
                 )
+                if pct is None:
+                    pct = first_present(
+                        row_values.get("holding percentage"),
+                        row_values.get("pct of portfolio"),
+                    )
                 add_holding_row(name, pct)
             return
 
@@ -540,74 +523,50 @@ def _parse_etf_breakdown(ticker: str) -> tuple[dict[str, float], dict[str, float
             for row in raw:
                 if not isinstance(row, dict):
                     continue
-                normalized = {str(k).strip().lower().replace("_", " ").replace("-", " "): v for k, v in row.items()}
-                name = first_present(
-                    normalized.get("holdingname"), normalized.get("holding name"),
-                    normalized.get("name"), normalized.get("symbol"),
-                )
-                pct = first_present(
-                    normalized.get("holdingpercent"), normalized.get("holding percent"),
-                    normalized.get("pctofportfolio"), normalized.get("pct of portfolio"),
-                    normalized.get("holding percentage"), normalized.get("weight"),
-                )
+                name = first_present(row.get("holdingName"), row.get("name"), row.get("symbol"))
+                pct = row.get("holdingPercent")
+                if pct is None:
+                    pct = first_present(row.get("pctOfPortfolio"), row.get("holding percent"))
                 add_holding_row(name, pct)
             return
 
         if isinstance(raw, dict):
-            normalized = {str(k).strip().lower().replace("_", " ").replace("-", " "): v for k, v in raw.items()}
-            if any(k in normalized for k in ("holdingpercent", "holding percent", "pctofportfolio", "pct of portfolio")):
-                name = first_present(
-                    normalized.get("holdingname"), normalized.get("holding name"),
-                    normalized.get("name"), normalized.get("symbol"),
-                )
-                pct = first_present(
-                    normalized.get("holdingpercent"), normalized.get("holding percent"),
-                    normalized.get("pctofportfolio"), normalized.get("pct of portfolio"),
-                    normalized.get("weight"),
-                )
+            # Also accept a single holding record or a symbol -> holding mapping.
+            if any(k in raw for k in ("holdingPercent", "holding percent", "pctOfPortfolio")):
+                name = first_present(raw.get("holdingName"), raw.get("name"), raw.get("symbol"))
+                pct = raw.get("holdingPercent")
+                if pct is None:
+                    pct = first_present(raw.get("pctOfPortfolio"), raw.get("holding percent"))
                 add_holding_row(name, pct)
             else:
                 for symbol, row in raw.items():
                     if isinstance(row, dict):
-                        row_values = {str(k).strip().lower().replace("_", " ").replace("-", " "): v for k, v in row.items()}
-                        name = first_present(
-                            row_values.get("holdingname"), row_values.get("holding name"),
-                            row_values.get("name"), row_values.get("symbol"), symbol,
-                        )
-                        pct = first_present(
-                            row_values.get("holdingpercent"), row_values.get("holding percent"),
-                            row_values.get("pctofportfolio"), row_values.get("pct of portfolio"),
-                            row_values.get("weight"),
-                        )
+                        name = first_present(row.get("holdingName"), row.get("name"), row.get("symbol"), symbol)
+                        pct = row.get("holdingPercent")
+                        if pct is None:
+                            pct = first_present(row.get("pctOfPortfolio"), row.get("holding percent"))
                         add_holding_row(name, pct)
 
+    # 1) Current yfinance API. It exposes sector_weightings as a dictionary
+    #    and top_holdings as a DataFrame.
     try:
-        ticker_obj = yf.Ticker(ticker)
-        get_funds_data = getattr(ticker_obj, "get_funds_data", None)
-        if callable(get_funds_data):
-            fund_api = get_funds_data()
-        else:
-            fund_api = getattr(ticker_obj, "funds_data", None)
-
+        fund_api = getattr(yf.Ticker(ticker), "funds_data", None)
         if fund_api is not None:
-            fund_detected = True
             add_sector_rows(getattr(fund_api, "sector_weightings", None))
             add_holding_rows(getattr(fund_api, "top_holdings", None))
-            if not top_holdings:
-                add_holding_rows(getattr(fund_api, "equity_holdings", None))
-            if sectors or top_holdings:
-                sources.append("yfinance")
-        else:
-            errors.append("yfinance: funds_data hat keine Daten geliefert.")
-    except Exception as exc:
-        errors.append(f"yfinance: {type(exc).__name__}: {exc}")
+    except Exception:
+        # Continue with yahooquery; an API or library-version issue in one
+        # provider should not hide data that the other provider can return.
+        pass
 
+    # 2) Compatibility fallback for yahooquery and older cached projects.
     if not sectors or not top_holdings:
         try:
-            yq = YQTicker(ticker, asynchronous=False)
+            yq = YQTicker(ticker)
             raw = getattr(yq, "fund_holding_info", None)
             fund_data = None
             if isinstance(raw, dict):
+                # Be tolerant of ticker casing and single-ticker response shapes.
                 for key, value in raw.items():
                     if str(key).upper() == ticker:
                         fund_data = value
@@ -616,37 +575,14 @@ def _parse_etf_breakdown(ticker: str) -> tuple[dict[str, float], dict[str, float
                     fund_data = next(iter(raw.values()))
 
             if isinstance(fund_data, dict):
-                fund_detected = True
                 if not sectors:
                     add_sector_rows(fund_data.get("sectorWeightings"))
                 if not top_holdings:
                     add_holding_rows(fund_data.get("holdings"))
-                if sectors or top_holdings:
-                    sources.append("yahooquery")
-            else:
-                errors.append("yahooquery: Yahoo hat keine ETF-Holding-Daten zurückgegeben.")
-        except Exception as exc:
-            errors.append(f"yahooquery: {type(exc).__name__}: {exc}")
+        except Exception:
+            pass
 
-    if not sectors and not top_holdings:
-        if not errors:
-            errors.append("Yahoo Finance hat für dieses Symbol keine Branchen- oder Holdings-Daten zurückgegeben.")
-        raise RuntimeError(" | ".join(errors))
-
-    return sectors, top_holdings, sources, errors, fund_detected
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def _get_etf_breakdown_cached(ticker: str) -> tuple[dict[str, float], dict[str, float], list[str], list[str], bool]:
-    return _parse_etf_breakdown(ticker)
-
-
-def get_etf_breakdown_yq(ticker: str) -> tuple[dict[str, float], dict[str, float], list[str], str | None, bool]:
-    try:
-        sectors, top_holdings, sources, warnings, fund_detected = _get_etf_breakdown_cached(str(ticker).upper().strip())
-        return sectors, top_holdings, sources, " | ".join(warnings) if warnings else None, fund_detected
-    except Exception as exc:
-        return {}, {}, [], str(exc), False
+    return sectors, top_holdings
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1684,8 +1620,8 @@ elif page == "3. Detailansicht":
 
         if selected_asset:
             fund_data = get_fundamentals_yq(selected_asset)
-            sectors, top_holdings, etf_sources, etf_error, fund_detected = get_etf_breakdown_yq(selected_asset)
-            is_etf = str(fund_data["quote_type"]).upper() in {"ETF", "MUTUALFUND", "MUTUAL FUND", "FUND"} or fund_detected or len(sectors) > 0 or len(top_holdings) > 0
+            sectors, top_holdings = get_etf_breakdown_yq(selected_asset)
+            is_etf = str(fund_data["quote_type"]).upper() in {"ETF", "MUTUALFUND", "MUTUAL FUND", "FUND"} or len(sectors) > 0 or len(top_holdings) > 0
             asset_currency = get_instrument_currency(selected_asset)
 
             st.caption(
@@ -1765,13 +1701,6 @@ elif page == "3. Detailansicht":
                         st.plotly_chart(fig_holdings, use_container_width=True)
                     else:
                         st.info("Keine Top-Holdings für dieses Instrument verfügbar.")
-
-                if etf_sources:
-                    st.caption(f"ETF-Datenquelle: {', '.join(etf_sources)}")
-                if etf_error:
-                    with st.expander("Warum fehlen ETF-Daten?"):
-                        st.warning(etf_error)
-                        st.caption(f"yfinance {getattr(yf, '__version__', 'unbekannt')}")
 
 
 elif page == "4. Risk-O-Meter":
